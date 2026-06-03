@@ -52,7 +52,7 @@ const char* WIFI_PASSWORD = "woaiwojia@2019";
 // API配置（修改这里）
 // ============================================================
 const char* API_URL = "https://api.minimaxi.com/v1/t2a_v2";
-const char* API_KEY = "sk-cp-0cx8-H-KKo14uqdNurVEZFw_U2KRjadkIGl3c41wfSVge75_ZE-v9GJHhtRyxZD96_l2461T8bK8KjGSRWwUj21Uhs_M1waHOZCuTViL3Vlvn10jh4iFPL0";
+const char* API_KEY = "YOUR_MINIMAX_API_KEY";
 
 // ============================================================
 // 引脚定义
