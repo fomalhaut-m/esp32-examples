@@ -1,12 +1,12 @@
 /**
  * ============================================================
- * ESP32-S3 WAV播放器
+ * ESP32-S3 异步WAV播放器
  * ============================================================
  * 
  * 怎么玩？
  *   按按钮1播放音乐
- *   再按一次切换下一首
- *   循环播放所有26个音效
+ *   播放中再按按钮1 → 停止/跳到下一首
+ *   播放完自动切换下一首
  * 
  * 硬件接线（按规则文件）：
  *   MAX98357A DIN  → GPIO 20
@@ -14,6 +14,10 @@
  *   MAX98357A BCLK → GPIO 21
  *   喇叭接MAX98357A的OUT+/OUT-
  *   按钮1           → GPIO 11
+ * 
+ * 异步播放原理：
+ *   用状态机控制播放，每次loop只发送一小块数据
+ *   这样按钮可以随时响应，不会被阻塞
  * 
  * 支持的音效（26个）：
  *   exit, game_over, game_start, h1, h2
@@ -27,18 +31,27 @@
 #include "wav_data.h"
 
 // ============================================================
-// 引脚定义（按规则文件）
+// 引脚定义
 // ============================================================
-#define PIN_AMP_DIN   20   // 数据输出
-#define PIN_AMP_LRC   47   // 声道选择
-#define PIN_AMP_BCLK  21   // 时钟
-#define PIN_BTN1      11   // 按钮1
+#define PIN_AMP_DIN   20
+#define PIN_AMP_LRC   47
+#define PIN_AMP_BCLK  21
+#define PIN_BTN1      11
 
 // ============================================================
 // I2S配置
 // ============================================================
 #define I2S_PORT       I2S_NUM_1
-#define SAMPLE_RATE    8000   // 匹配WAV采样率
+#define SAMPLE_RATE    8000
+
+// ============================================================
+// 播放状态机
+// ============================================================
+enum PlayState {
+    STATE_IDLE,      // 空闲
+    STATE_PLAYING,   // 播放中
+    STATE_PAUSED     // 暂停
+};
 
 // ============================================================
 // 音效列表
@@ -78,9 +91,17 @@ Sound sounds[] = {
     {"wrong",       WAV_wrong,       WAV_wrong_len},
 };
 
-int currentSound = 0;
 int totalSounds = sizeof(sounds) / sizeof(sounds[0]);
-bool isPlaying = false;
+
+// ============================================================
+// 播放器变量
+// ============================================================
+PlayState playState = STATE_IDLE;
+int currentSound = 0;
+uint32_t playIndex = 0;        // 当前播放位置
+const int8_t* playData = NULL; // 当前播放数据
+uint32_t playLen = 0;          // 当前播放长度
+int16_t playBuffer[256];       // 播放缓冲区
 
 // ============================================================
 // 初始化I2S
@@ -112,35 +133,51 @@ void i2sInit() {
 }
 
 // ============================================================
-// 播放8位WAV数据（转成16位输出）
+// 开始播放（异步）
 // ============================================================
-void playWav(const int8_t* data, uint32_t len) {
-    size_t written;
-    int16_t buffer[256];
+void startPlay(int index) {
+    if (index < 0 || index >= totalSounds) return;
     
-    isPlaying = true;
-    Serial.printf("Playing %u samples...\n", len);
+    Serial.printf("Start: %s\n", sounds[index].name);
     
-    for (uint32_t i = 0; i < len; i += 256) {
-        int chunk = min((uint32_t)256, len - i);
-        for (int j = 0; j < chunk; j++) {
-            buffer[j] = data[i + j] * 256;  // 8位转16位
-        }
-        i2s_write(I2S_PORT, buffer, chunk * sizeof(int16_t), &written, portMAX_DELAY);
-    }
-    
-    isPlaying = false;
-    Serial.println("Done");
+    playData = sounds[index].data;
+    playLen = sounds[index].len;
+    playIndex = 0;
+    playState = STATE_PLAYING;
 }
 
 // ============================================================
-// 播放指定音效
+// 停止播放
 // ============================================================
-void playSound(int index) {
-    if (index < 0 || index >= totalSounds) return;
+void stopPlay() {
+    playState = STATE_IDLE;
+    playIndex = 0;
+    Serial.println("Stop");
+}
+
+// ============================================================
+// 播放更新（每次loop调用，只发一小块）
+// ============================================================
+void playUpdate() {
+    if (playState != STATE_PLAYING) return;
+    if (playIndex >= playLen) {
+        // 播放完成，自动下一首
+        Serial.println("Done");
+        currentSound = (currentSound + 1) % totalSounds;
+        startPlay(currentSound);
+        return;
+    }
     
-    Serial.printf("Playing: %s\n", sounds[index].name);
-    playWav(sounds[index].data, sounds[index].len);
+    // 每次发送64个采样（约8ms）
+    int chunk = min((uint32_t)64, playLen - playIndex);
+    for (int j = 0; j < chunk; j++) {
+        playBuffer[j] = playData[playIndex + j] * 256;
+    }
+    
+    size_t written;
+    i2s_write(I2S_PORT, playBuffer, chunk * sizeof(int16_t), &written, portMAX_DELAY);
+    
+    playIndex += chunk;
 }
 
 // ============================================================
@@ -151,7 +188,7 @@ bool checkButton() {
     bool btn = digitalRead(PIN_BTN1);
     
     if (btn == LOW && lastBtn == HIGH) {
-        delay(50);  // 消抖
+        delay(50);
         if (digitalRead(PIN_BTN1) == LOW) {
             lastBtn = btn;
             return true;
@@ -165,26 +202,44 @@ bool checkButton() {
 // 初始化
 // ============================================================
 void setup() {
-    Serial.begin(115200);
-    Serial.println("WAV Player Demo");
+    Serial.begin(11200);
+    Serial.println("Async WAV Player");
     Serial.printf("Total sounds: %d\n", totalSounds);
     
     pinMode(PIN_BTN1, INPUT_PULLUP);
     i2sInit();
     
-    Serial.println("Press BTN1 to play/next");
+    Serial.println("Press BTN1 to play/pause/next");
 }
 
 // ============================================================
-// 主循环
+// 主循环（异步）
 // ============================================================
 void loop() {
+    // 1. 按钮处理
     if (checkButton()) {
-        if (!isPlaying) {
-            playSound(currentSound);
-            currentSound = (currentSound + 1) % totalSounds;
+        switch (playState) {
+            case STATE_IDLE:
+                // 空闲 → 播放当前
+                startPlay(currentSound);
+                break;
+                
+            case STATE_PLAYING:
+                // 播放中 → 停止，切换下一首
+                stopPlay();
+                currentSound = (currentSound + 1) % totalSounds;
+                break;
+                
+            case STATE_PAUSED:
+                // 暂停 → 继续播放
+                playState = STATE_PLAYING;
+                break;
         }
     }
     
-    delay(10);
+    // 2. 异步播放更新（非阻塞）
+    playUpdate();
+    
+    // 3. 小延时
+    delay(1);
 }
