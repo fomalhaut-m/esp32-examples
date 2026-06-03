@@ -1,412 +1,822 @@
 /**
  * ============================================================
- * ESP32-S3 MiniMax TTS语音合成
+ * ESP32-S3 多功能趣味交互装置（面向对象版本）
  * ============================================================
  * 
- * 怎么玩？
- *   按按钮1 → 调用MiniMax TTS API → 播放语音
  * 
- * 硬件接线（按规则文件）：
- *   MAX98357A DIN  → GPIO 20
- *   MAX98357A LRC  → GPIO 47
- *   MAX98357A BCLK → GPIO 21
- *   喇叭接MAX98357A的OUT+/OUT-
- *   按钮1           → GPIO 11
+ * ===================== 怎么玩？=====================
  * 
- * 功能说明：
- *   1. 连接WiFi
- *   2. 按按钮1调用MiniMax TTS API
- *   3. 获取返回的WAV音频（hex编码）
- *   4. 逐字符流式解码hex并播放
+ * 【按钮1 - 天气播报】
+ *   按一下按钮1
+ *   → 绿灯亮
+ *   → OLED显示当前温度和湿度
+ *   → 喇叭播报温度/湿度语音
+ *   → 如果温度>30℃，红灯亮 + 报警"温度过高"
  * 
- * ============================================================
- * 使用前需要：
- *   1. 修改WiFi名称和密码
- *   2. 修改API Key
- *   3. 安装ESP32 Arduino库（带HttpClient）
- * ============================================================
+ * 【按钮2 - 录音留言】
+ *   按一下按钮2
+ *   → 黄灯亮，OLED显示"录音中..."
+ *   → 麦克风开始收音
+ *   → 再按一下停止录音，自动播放刚才录的声音
+ * 
+ * 【按钮3 - 灯光游戏】
+ *   按一下按钮3启动游戏
+ *   → 红灯随机亮起
+ *   → 最快按下按钮的人得分
+ *   → 语音+OLED播报分数
+ * 
+ * 【待机状态】
+ *   → 绿灯呼吸灯（一闪一闪）
+ *   → OLED显示"Multi-Device Ready!"
+ * 
+ * 
+ * ===================== 硬件接线 =====================
+ * 
+ *   功放模块(MAX98357A) →  GPIO 20/47/21
+ *   麦克风(INMP441)     →  GPIO 39/40/41
+ *   温湿度(DHT11)        →  GPIO 4
+ *   屏幕(OLED)           →  GPIO 36/37
+ *   红灯                  →  GPIO 15
+ *   黄灯                  →  GPIO 16
+ *   绿灯                  →  GPIO 17
+ *   按钮1/2/3              →  GPIO 11/12/13
+ * 
+ * 
+ * ===================== 音效列表 =====================
+ * 
+ *  使用wav_data.h中的26个音效：
+ *   - ready: 启动音效
+ *   - t1, t2: 温度提示
+ *   - h1, h2: 湿度提示
+ *   - warn_temp, warn_humi: 报警音
+ *   - rec_start, rec_stop: 录音提示
+ *   - play_back: 播放提示
+ *   - game_start, game_over: 游戏音效
+ *   - right, wrong: 答题音效
+ *   - num0-9: 数字语音
+ * 
+ * 
+ * ===================== 学习目标 =====================
+ * 
+ *  面向对象编程：将每个模块封装成类
+ *   - LED类：封装LED控制
+ *   - Button类：封装按钮检测
+ *   - DHT11Sensor类：封装温湿度
+ *   - OLEDDisplay类：封装屏幕
+ *   - AudioPlayer类：封装音频播放（支持WAV）
+ *   - Recorder类：封装录音
  */
 
+// ============================================================
+// 第1步：加载库
+// ============================================================
+
 #include <Arduino.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
 #include <driver/i2s.h>
+#include <U8g2lib.h>
+#include <DHT.h>
+#include "wav_data.h"  // 音效数据
 
 // ============================================================
-// Hex解码
+// 第2步：定义引脚常量
 // ============================================================
-static int8_t hexCharToVal(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+
+// 功放(MAX98357A)
+const int PIN_AMP_DIN = 20;
+const int PIN_AMP_LRC = 47;
+const int PIN_AMP_BCLK = 21;
+
+// 麦克风(INMP441)
+const int PIN_MIC_SCK = 40;
+const int PIN_MIC_WS = 41;
+const int PIN_MIC_SD = 39;
+
+// 温湿度(DHT11)
+const int PIN_DHT = 4;
+
+// 显示(OLED)
+const int PIN_OLED_SCL = 36;
+const int PIN_OLED_SDA = 37;
+
+// LED
+const int PIN_LED_RED = 15;
+const int PIN_LED_YELLOW = 16;
+const int PIN_LED_GREEN = 17;
+
+// 按钮
+const int PIN_BTN1 = 11;
+const int PIN_BTN2 = 12;
+const int PIN_BTN3 = 13;
+
+// ============================================================
+// 第3步：LED类
+// ============================================================
+
+class LED {
+private:
+    int pin;
+    bool state;
+    const char* name;
+
+public:
+    LED(int ledPin, const char* ledName) : pin(ledPin), state(false), name(ledName) {
+        pinMode(pin, OUTPUT);
+        off();
+    }
+    
+    void on() {
+        digitalWrite(pin, HIGH);
+        state = true;
+        Serial.printf("[LED] %s ON\n", name);
+    }
+    
+    void off() {
+        digitalWrite(pin, LOW);
+        state = false;
+        Serial.printf("[LED] %s OFF\n", name);
+    }
+    
+    void toggle() {
+        state ? off() : on();
+    }
+    
+    bool isOn() {
+        return state;
+    }
+};
+
+// ============================================================
+// 第4步：按钮类
+// ============================================================
+
+class Button {
+private:
+    int pin;
+    int lastState;
+
+public:
+    Button(int btnPin) : pin(btnPin), lastState(HIGH) {
+        pinMode(pin, INPUT_PULLUP);
+    }
+    
+    void begin() {
+        pinMode(pin, INPUT_PULLUP);
+    }
+    
+    // 检测按下（瞬间触发）
+    bool pressed() {
+        int state = digitalRead(pin);
+        if (state == LOW && lastState == HIGH) {
+            lastState = state;
+            return true;
+        }
+        lastState = state;
+        return false;
+    }
+};
+
+// ============================================================
+// 第5步：温湿度传感器类
+// ============================================================
+
+class DHT11Sensor {
+private:
+    DHT* sensor;
+    float temperature;
+    float humidity;
+    unsigned long lastRead;
+    bool valid;
+
+public:
+    DHT11Sensor(int dhtPin) : temperature(0), humidity(0), valid(false) {
+        sensor = new DHT(dhtPin, DHT11);
+    }
+    
+    void begin() {
+        sensor->begin();
+        delay(2000);
+        lastRead = 0;
+        read();
+    }
+    
+    void read() {
+        if (millis() - lastRead > 2000) {
+            temperature = sensor->readTemperature();
+            humidity = sensor->readHumidity();
+            valid = !isnan(temperature) && !isnan(humidity);
+            lastRead = millis();
+        }
+    }
+    
+    float getTemperature() { return temperature; }
+    float getHumidity() { return humidity; }
+    bool isValid() { return valid; }
+    bool isTooHot() { return temperature > 30; }
+    bool isTooHumid() { return humidity > 80; }
+};
+
+// ============================================================
+// 第6步：OLED显示类
+// ============================================================
+
+class OLEDDisplay {
+public:
+    U8G2_SSD1306_128X32_UNIVISION_F_SW_I2C* u8g2;
+
+    OLEDDisplay(int scl, int sda) {
+        u8g2 = new U8G2_SSD1306_128X32_UNIVISION_F_SW_I2C(
+            U8G2_R0, scl, sda, U8X8_PIN_NONE
+        );
+    }
+    
+    void begin() {
+        u8g2->begin();
+        u8g2->setFont(u8g2_font_ncenB08_tr);
+    }
+    
+    void print(const char* line1, const char* line2 = "", const char* line3 = "") {
+        Serial.printf("[OLED] %s | %s | %s\n", line1, line2, line3);
+        u8g2->clearBuffer();
+        u8g2->setFont(u8g2_font_ncenB08_tr);
+        u8g2->drawStr(0, 10, line1);
+        u8g2->drawStr(0, 20, line2);
+        u8g2->drawStr(0, 30, line3);
+        u8g2->sendBuffer();
+    }
+    
+    void clear() {
+        u8g2->clearBuffer();
+        u8g2->sendBuffer();
+    }
+};
+
+// ============================================================
+// 第7步：音量变量（全局）
+// ============================================================
+
+int micVolume = 0;      // 麦克风音量 0-100
+int speakerVolume = 0;  // 播放音量 0-100
+
+// 更新播放音量
+void updateSpeakerVolume(int16_t* data, int len) {
+    if (len <= 0) return;
+    long sum = 0;
+    for (int i = 0; i < len; i++) {
+        sum += abs(data[i]);
+    }
+    int avg = sum / len;
+    speakerVolume = constrain(map(avg, 0, 2000, 0, 100), 0, 100);
 }
 
 // ============================================================
-// WiFi配置（修改这里）
+// 第8步：音频播放器类
 // ============================================================
-const char* WIFI_SSID = "NYF_72";
-const char* WIFI_PASSWORD = "woaiwojia@2019";
 
-// ============================================================
-// API配置（修改这里）
-// ============================================================
-const char* API_URL = "https://api.minimaxi.com/v1/t2a_v2";
-const char* API_KEY = "sk-cp-0cx8-H-KKo14uqdNurVEZFw_U2KRjadkIGl3c41wfSVge75_ZE-v9GJHhtRyxZD96_l2461T8bK8KjGSRWwUj21Uhs_M1waHOZCuTViL3Vlvn10jh4iFPL0";
+class AudioPlayer {
+private:
+    i2s_port_t i2sNum;
+    int sampleRate;
 
-// ============================================================
-// 引脚定义
-// ============================================================
-#define PIN_AMP_DIN   20
-#define PIN_AMP_LRC   47
-#define PIN_AMP_BCLK  21
-#define PIN_BTN1      11
-
-// ============================================================
-// I2S配置
-// ============================================================
-#define I2S_PORT       I2S_NUM_1
-#define SAMPLE_RATE    32000  // MiniMax API返回的采样率
-
-// ============================================================
-// TTS配置
-// ============================================================
-const char* TTS_TEXT = "你好，我是智能助手，很高兴为你服务！今天天气不错，记得多喝水哦！";
-const char* TTS_VOICE = "male-qn-qingse";  // MiniMax音色ID
-
-// ============================================================
-// 音频缓冲区
-// ============================================================
-int16_t* audioBuffer = NULL;
-int audioSamples = 0;
-
-// ============================================================
-// 初始化I2S
-// ============================================================
-void i2sInit() {
-    i2s_config_t config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 2,
-        .dma_buf_len = 256,
-        .use_apll = true,
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
-    };
-
-    i2s_pin_config_t pins = {
-        .bck_io_num = PIN_AMP_BCLK,
-        .ws_io_num = PIN_AMP_LRC,
-        .data_out_num = PIN_AMP_DIN,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
-
-    i2s_driver_install(I2S_PORT, &config, 0, NULL);
-    i2s_set_pin(I2S_PORT, &pins);
-}
-
-// ============================================================
-// 连接WiFi
-// ============================================================
-bool connectWiFi() {
-    Serial.printf("[WiFi] Connecting to %s\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+public:
+    AudioPlayer(i2s_port_t port, int rate) 
+        : i2sNum(port), sampleRate(rate) {}
     
-    int timeout = 20;
-    while (WiFi.status() != WL_CONNECTED && timeout > 0) {
-        delay(500);
-        Serial.print(".");
-        timeout--;
+    void begin(int din, int lrc, int bclk) {
+        i2s_config_t config = {
+            .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+            .sample_rate = sampleRate,
+            .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+            .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+            .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+            .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+            .dma_buf_count = 2,
+            .dma_buf_len = 256,
+            .use_apll = true,
+            .tx_desc_auto_clear = true,
+            .fixed_mclk = 0
+        };
+
+        i2s_pin_config_t pins = {
+            .bck_io_num = bclk,
+            .ws_io_num = lrc,
+            .data_out_num = din,
+            .data_in_num = I2S_PIN_NO_CHANGE
+        };
+
+        i2s_driver_install(i2sNum, &config, 0, NULL);
+        i2s_set_pin(i2sNum, &pins);
     }
     
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-        return true;
-    } else {
-        Serial.println("\n[WiFi] Failed!");
-        return false;
-    }
-}
-
-// ============================================================
-// 调用MiniMax TTS API（逐字符流式处理）
-// ============================================================
-bool callTTS() {
-    Serial.println("[TTS] Calling MiniMax API...");
-    
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[TTS] WiFi not connected!");
-        return false;
-    }
-    
-    HTTPClient http;
-    http.begin(API_URL);
-    http.setTimeout(60000);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", String("Bearer ") + API_KEY);
-    http.addHeader("Accept-Encoding", "identity");
-    
-    // 构建请求JSON
-    String json = "{";
-    json += "\"model\":\"speech-2.8-hd\",";
-    json += "\"text\":\"" + String(TTS_TEXT) + "\",";
-    json += "\"stream\":false,";
-    json += "\"voice_setting\":{";
-    json += "\"voice_id\":\"" + String(TTS_VOICE) + "\",";
-    json += "\"speed\":1,";
-    json += "\"vol\":1,";
-    json += "\"pitch\":0,";
-    json += "\"emotion\":\"happy\"";
-    json += "},";
-    json += "\"audio_setting\":{";
-    json += "\"sample_rate\":32000,";
-    json += "\"bitrate\":128000,";
-    json += "\"format\":\"wav\",";
-    json += "\"channel\":1";
-    json += "},";
-    json += "\"subtitle_enable\":false";
-    json += "}";
-    
-    Serial.printf("[TTS] Request: %d bytes\n", json.length());
-    
-    int httpCode = http.POST(json);
-    Serial.printf("[TTS] HTTP code: %d, size: %d\n", httpCode, http.getSize());
-    
-    if (httpCode != 200) {
-        Serial.printf("[TTS] HTTP error: %d\n", httpCode);
-        String err = http.getString();
-        if (err.length() > 0) Serial.println(err);
-        http.end();
-        return false;
-    }
-    
-    // 获取响应流，逐字符处理（不占用大内存）
-    WiFiClient &stream = http.getStream();
-    
-    // 状态机解析JSON
-    enum { S_NORMAL, S_KEY, S_VALUE } state = S_NORMAL;
-    
-    int sampleRate = 32000;
-    int channels = 1;
-    int statusCode = -1;
-    
-    char keyBuf[32];
-    int keyLen = 0;
-    char valBuf[32];
-    int valLen = 0;
-    char numBuf[16];
-    int numLen = 0;
-    
-    // PCM缓冲区（870KB hex ≈ 435KB PCM）
-    #define MAX_PCM_BYTES 500000
-    uint8_t *pcm = NULL;
-    int pcmBytes = 0;
-    bool audioDecoding = false;
-    bool audioFound = false;
-    
-    int wavSkipLeft = 88;  // 跳过WAV头（44字节 = 88个hex字符）
-    bool hexHigh = true;
-    uint8_t hexByte = 0;
-    int totalHexRead = 0;
-    
-    unsigned long startMs = millis();
-    
-    while (stream.connected() || stream.available()) {
-        if (millis() - startMs > 60000) { Serial.println("[TTS] Timeout!"); break; }
-        if (!stream.available()) { delay(1); continue; }
-        int c = stream.read();
-        if (c < 0) break;
+    // 播放WAV数据（8位转16位）
+    void playWav(const int8_t* data, uint32_t len) {
+        Serial.printf("[AUDIO] playWav: %u samples\n", len);
+        size_t written;
+        int16_t buffer[256];
         
-        // ===== hex解码模式：直接处理每个字符 =====
-        if (audioDecoding) {
-            if (c == '"') {
-                // hex数据结束（遇到JSON引号）
-                audioDecoding = false;
-                Serial.printf("[TTS] Hex end. Total: %d chars\n", totalHexRead);
-                break;
+        for (uint32_t i = 0; i < len; i += 256) {
+            int chunk = min((uint32_t)256, len - i);
+            for (int j = 0; j < chunk; j++) {
+                buffer[j] = data[i + j] * 256;
             }
-            int8_t val = hexCharToVal(c);
-            if (val < 0) continue;
-            totalHexRead++;
-            if (wavSkipLeft > 0) { wavSkipLeft--; continue; }
-            if (hexHigh) {
-                hexByte = val << 4;
-                hexHigh = false;
-            } else {
-                hexByte |= val;
-                hexHigh = true;
-                if (pcm && pcmBytes < MAX_PCM_BYTES) {
-                    pcm[pcmBytes++] = hexByte;
-                }
+            updateSpeakerVolume(buffer, chunk);
+            i2s_write(i2sNum, buffer, chunk * sizeof(int16_t), &written, portMAX_DELAY);
+        }
+        speakerVolume = 0;
+        Serial.println("[AUDIO] playWav done");
+    }
+    
+    // 播放16位数据
+    void play16bit(const int16_t* data, uint32_t len) {
+        Serial.printf("[AUDIO] play16bit: %u samples\n", len);
+        size_t written;
+        int16_t buffer[256];
+        for (uint32_t i = 0; i < len; i += 256) {
+            int chunk = min((uint32_t)256, len - i);
+            memcpy(buffer, &data[i], chunk * sizeof(int16_t));
+            updateSpeakerVolume(buffer, chunk);
+            i2s_write(i2sNum, buffer, chunk * sizeof(int16_t), &written, portMAX_DELAY);
+        }
+        speakerVolume = 0;
+        Serial.println("[AUDIO] play16bit done");
+    }
+    
+    // 播放指定频率声音
+    void playTone(int freq, int ms) {
+        Serial.printf("[AUDIO] playTone: %dHz %dms\n", freq, ms);
+        int samples = sampleRate * ms / 1000;
+        int16_t buffer[256];
+        
+        for (int n = 0; n < samples; n += 256) {
+            int chunk = min(256, samples - n);
+            for (int i = 0; i < chunk; i++) {
+                float t = (float)(n + i) / sampleRate;
+                buffer[i] = (int16_t)(16000 * sin(2 * PI * freq * t));
             }
-            continue;
+            updateSpeakerVolume(buffer, chunk);
+            size_t written;
+            i2s_write(i2sNum, buffer, chunk * sizeof(int16_t), &written, portMAX_DELAY);
+        }
+        speakerVolume = 0;
+        Serial.println("[AUDIO] playTone done");
+    }
+    
+    void beep() {
+        playTone(440, 200);
+    }
+};
+
+// ============================================================
+// 第8步：录音机类
+// ============================================================
+
+class Recorder {
+private:
+    static const int BUFFER_SIZE = 8000;  // 0.5秒@16000Hz
+    int16_t buffer[BUFFER_SIZE];
+    int index;
+    bool recording;
+    i2s_port_t i2sPort;
+
+public:
+    Recorder(i2s_port_t port) : index(0), recording(false), i2sPort(port) {}
+    
+    void begin(int sck, int ws, int sd) {
+        i2s_config_t config = {
+            .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+            .sample_rate = 16000,
+            .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+            .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+            .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+            .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+            .dma_buf_count = 4,
+            .dma_buf_len = 512,
+            .use_apll = false,
+            .tx_desc_auto_clear = false,
+            .fixed_mclk = 0
+        };
+
+        i2s_pin_config_t pins = {
+            .bck_io_num = sck,
+            .ws_io_num = ws,
+            .data_out_num = I2S_PIN_NO_CHANGE,
+            .data_in_num = sd
+        };
+
+        i2s_driver_install(i2sPort, &config, 0, NULL);
+        i2s_set_pin(i2sPort, &pins);
+        i2s_zero_dma_buffer(i2sPort);
+    }
+    
+    void start() {
+        index = 0;
+        recording = true;
+        Serial.println("[REC] Start recording");
+    }
+    
+    void stop() {
+        recording = false;
+        Serial.printf("[REC] Stop recording, %d samples\n", index);
+    }
+    
+    // 录音采样（异步，每次loop调用）
+    // 返回读取的采样数，用于音量计算
+    int update() {
+        if (!recording) return 0;
+        if (index >= BUFFER_SIZE) {
+            recording = false;
+            Serial.println("[REC] Buffer full, auto stop");
+            return 0;
         }
         
-        // ===== JSON解析模式 =====
-        if (c == '"') {
-            if (state == S_NORMAL) {
-                state = S_KEY; keyLen = 0;
-            } else if (state == S_KEY) {
-                state = S_VALUE; keyBuf[keyLen] = '\0'; valLen = 0;
-            } else if (state == S_VALUE) {
-                valBuf[valLen] = '\0';
-                state = S_NORMAL;
-            }
-            continue;
+        int16_t sample[256];
+        size_t bytes;
+        i2s_read(i2sPort, sample, sizeof(sample), &bytes, 0);
+        int count = bytes / sizeof(int16_t);
+        
+        // 调试：打印前几个采样值
+        if (index == 0 && count > 0) {
+            Serial.printf("[REC] First samples: %d %d %d %d\n", 
+                sample[0], sample[1], sample[2], sample[3]);
         }
         
-        if (state == S_KEY) {
-            if (keyLen < 31) keyBuf[keyLen++] = c;
-            continue;
+        for (int i = 0; i < count && index < BUFFER_SIZE; i++) {
+            buffer[index++] = sample[i];
         }
         
-        if (state == S_VALUE) {
-            // audio字段：开始hex解码
-            if (strcmp(keyBuf, "audio") == 0 && valLen == 0) {
-                audioDecoding = true;
-                audioFound = true;
-                pcm = (uint8_t*)malloc(MAX_PCM_BYTES);
-                if (!pcm) {
-                    Serial.printf("[TTS] Cannot alloc %d bytes\n", MAX_PCM_BYTES);
-                    http.end(); return false;
-                }
-                Serial.printf("[TTS] Audio: %dHz, %dch — decoding hex...\n", sampleRate, channels);
-                i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, (i2s_channel_t)channels);
-                // 处理当前字符
-                int8_t val = hexCharToVal(c);
-                if (val >= 0) {
-                    totalHexRead++;
-                    if (wavSkipLeft > 0) { wavSkipLeft--; }
-                    else { hexByte = val << 4; hexHigh = false; }
-                }
-                continue;
-            }
-            valBuf[valLen++] = c;
-            if (valLen < 31) valBuf[valLen] = '\0';
-            continue;
-        }
+        return count;  // 返回读取的采样数
+    }
+    
+    // 获取录音缓冲区（用于音量计算）
+    int16_t* getBuffer() { return buffer; }
+    int getBufferSize() { return index; }
+    
+    // 播放录音（降采样16000→8000）
+    void playback(AudioPlayer& player) {
+        Serial.printf("[REC] Playback: %d samples\n", index);
         
-        // 数字值（引号外，如 "status_code": 0）
-        if (state == S_NORMAL && c >= '0' && c <= '9') {
-            if (numLen < 15) numBuf[numLen++] = c;
-            numBuf[numLen] = '\0';
-            continue;
+        // 调试：打印录音数据范围
+        int16_t minVal = 32767, maxVal = -32768;
+        for (int i = 0; i < index; i++) {
+            if (buffer[i] < minVal) minVal = buffer[i];
+            if (buffer[i] > maxVal) maxVal = buffer[i];
         }
-        if (state == S_NORMAL && numLen > 0 && (c == ',' || c == '}' || c == ']')) {
-            numBuf[numLen] = '\0';
-            // 处理数字字段
-            if (strcmp(keyBuf, "status_code") == 0) {
-                statusCode = atoi(numBuf);
-                if (statusCode != 0) Serial.printf("[TTS] API error: %d\n", statusCode);
-            } else if (strcmp(keyBuf, "audio_sample_rate") == 0) {
-                sampleRate = atoi(numBuf);
-            } else if (strcmp(keyBuf, "audio_channel") == 0) {
-                channels = atoi(numBuf);
-            }
-            numLen = 0; keyLen = 0;
-            continue;
+        Serial.printf("[REC] Data range: %d to %d\n", minVal, maxVal);
+        
+        // 每2个采样取1个，实现16000→8000降采样
+        static int16_t downsampled[BUFFER_SIZE / 2];
+        int len = 0;
+        for (int i = 0; i < index; i += 2) {
+            // 放大音量：乘以2
+            int32_t sample = buffer[i] * 2;
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            downsampled[len++] = (int16_t)sample;
         }
+        Serial.printf("[REC] Playing %d downsampled samples\n", len);
+        player.play16bit(downsampled, len);
     }
     
-    http.end();
-    
-    if (!audioFound || !pcm) {
-        Serial.println("[TTS] No audio data received!");
-        return false;
-    }
-    
-    // 释放未用完的内存
-    if (pcmBytes < MAX_PCM_BYTES) {
-        pcm = (uint8_t*)realloc(pcm, pcmBytes);
-    }
-    
-    audioBuffer = (int16_t*)pcm;
-    audioSamples = pcmBytes / 2;
-    Serial.printf("[TTS] Done! %d hex -> %d PCM -> %d samples\n", totalHexRead, pcmBytes, audioSamples);
-    Serial.printf("[TTS] Duration: %.2f seconds\n", (float)audioSamples / (sampleRate * channels));
-    
-    return audioSamples > 0;
-}
+    bool isRecording() { return recording; }
+    int getLength() { return index; }
+};
 
 // ============================================================
-// 播放音频
+// 第9步：创建全局对象
 // ============================================================
-void playAudio() {
-    if (audioBuffer == NULL || audioSamples == 0) {
-        Serial.println("[PLAY] No audio to play!");
+
+LED ledRed(PIN_LED_RED, "RED");
+LED ledYellow(PIN_LED_YELLOW, "YELLOW");
+LED ledGreen(PIN_LED_GREEN, "GREEN");
+
+Button btn1(PIN_BTN1);
+Button btn2(PIN_BTN2);
+Button btn3(PIN_BTN3);
+
+DHT11Sensor dht11(PIN_DHT);
+OLEDDisplay oled(PIN_OLED_SCL, PIN_OLED_SDA);
+AudioPlayer player(I2S_NUM_1, 8000);
+Recorder recorder(I2S_NUM_0);
+
+// ============================================================
+// 第10步：系统状态
+// ============================================================
+
+enum Mode { IDLE, WEATHER, RECORDING, PLAYING, GAME_WAIT, GAME_PLAY };
+Mode currentMode = IDLE;
+
+// 游戏变量
+unsigned long gameStartTime = 0;
+int gameScore = 0;
+bool gameLedOn = false;
+
+// ============================================================
+// 第11步：数字播报函数
+// ============================================================
+
+// 播报数字（逐位播放）
+void playNumber(int num) {
+    if (num < 0 || num > 99) return;
+    
+    if (num == 0) {
+        player.playWav(WAV_num0, WAV_num0_len);
         return;
     }
     
-    Serial.printf("[PLAY] Playing %d samples...\n", audioSamples);
-    
-    size_t written;
-    for (int i = 0; i < audioSamples; i += 256) {
-        int chunk = min(256, audioSamples - i);
-        i2s_write(I2S_PORT, &audioBuffer[i], chunk * sizeof(int16_t), &written, portMAX_DELAY);
+    // 十位
+    int tens = num / 10;
+    if (tens > 0) {
+        switch (tens) {
+            case 1: player.playWav(WAV_num1, WAV_num1_len); break;
+            case 2: player.playWav(WAV_num2, WAV_num2_len); break;
+            case 3: player.playWav(WAV_num3, WAV_num3_len); break;
+            case 4: player.playWav(WAV_num4, WAV_num4_len); break;
+            case 5: player.playWav(WAV_num5, WAV_num5_len); break;
+            case 6: player.playWav(WAV_num6, WAV_num6_len); break;
+            case 7: player.playWav(WAV_num7, WAV_num7_len); break;
+            case 8: player.playWav(WAV_num8, WAV_num8_len); break;
+            case 9: player.playWav(WAV_num9, WAV_num9_len); break;
+        }
+        delay(200);
     }
     
-    Serial.println("[PLAY] Done!");
-}
-
-// ============================================================
-// 按钮检测
-// ============================================================
-bool checkButton() {
-    static bool lastBtn = HIGH;
-    bool btn = digitalRead(PIN_BTN1);
-    
-    if (btn == LOW && lastBtn == HIGH) {
-        delay(50);
-        if (digitalRead(PIN_BTN1) == LOW) {
-            lastBtn = btn;
-            return true;
+    // 个位
+    int ones = num % 10;
+    if (ones > 0 || tens == 0) {
+        switch (ones) {
+            case 0: player.playWav(WAV_num0, WAV_num0_len); break;
+            case 1: player.playWav(WAV_num1, WAV_num1_len); break;
+            case 2: player.playWav(WAV_num2, WAV_num2_len); break;
+            case 3: player.playWav(WAV_num3, WAV_num3_len); break;
+            case 4: player.playWav(WAV_num4, WAV_num4_len); break;
+            case 5: player.playWav(WAV_num5, WAV_num5_len); break;
+            case 6: player.playWav(WAV_num6, WAV_num6_len); break;
+            case 7: player.playWav(WAV_num7, WAV_num7_len); break;
+            case 8: player.playWav(WAV_num8, WAV_num8_len); break;
+            case 9: player.playWav(WAV_num9, WAV_num9_len); break;
         }
     }
-    lastBtn = btn;
-    return false;
 }
 
 // ============================================================
-// 初始化
+// 第13步：音量显示
 // ============================================================
+
+// 在OLED上绘制音量条
+void drawVolumeBars() {
+    oled.u8g2->clearBuffer();
+    oled.u8g2->setFont(u8g2_font_ncenB08_tr);
+    
+    // 标题
+    oled.u8g2->drawStr(0, 8, "MIC");
+    oled.u8g2->drawStr(64, 8, "SPK");
+    
+    // 麦克风音量条
+    int micBar = map(micVolume, 0, 100, 0, 120);
+    oled.u8g2->drawFrame(0, 12, 124, 10);
+    oled.u8g2->drawBox(2, 14, micBar, 6);
+    
+    // 播放音量条
+    int spkBar = map(speakerVolume, 0, 100, 0, 120);
+    oled.u8g2->drawFrame(0, 24, 124, 10);
+    oled.u8g2->drawBox(2, 26, spkBar, 6);
+    
+    oled.u8g2->sendBuffer();
+}
+
+// 更新麦克风音量
+void updateMicVolume(int16_t* data, int len) {
+    if (len <= 0) return;
+    long sum = 0;
+    for (int i = 0; i < len; i++) {
+        sum += abs(data[i]);
+    }
+    micVolume = constrain(map(sum / len, 0, 2000, 0, 100), 0, 100);
+}
+
+// ============================================================
+// 第15步：初始化
+// ============================================================
+
 void setup() {
     Serial.begin(115200);
-    Serial.println("MiniMax TTS Demo");
-    
-    pinMode(PIN_BTN1, INPUT_PULLUP);
-    i2sInit();
-    
-    if (!connectWiFi()) {
-        Serial.println("WiFi failed! Restarting...");
-        delay(3000);
-        ESP.restart();
-    }
-    
-    Serial.println("Ready! Press BTN1 to speak.");
+    Serial.println("Multi-Device Demo");
+
+    dht11.begin();
+    oled.begin();
+    player.begin(PIN_AMP_DIN, PIN_AMP_LRC, PIN_AMP_BCLK);
+    recorder.begin(PIN_MIC_SCK, PIN_MIC_WS, PIN_MIC_SD);
+
+    btn1.begin();
+    btn2.begin();
+    btn3.begin();
+
+    oled.print("Multi-Device", "Ready!", "Press BTN1-3");
+    player.playWav(WAV_ready, WAV_ready_len);
 }
 
 // ============================================================
-// 主循环
+// 第16步：游戏逻辑
 // ============================================================
-void loop() {
-    if (checkButton()) {
-        Serial.println("=== Button pressed ===");
+
+void gameStart() {
+    Serial.println("[GAME] Start");
+    currentMode = GAME_WAIT;
+    gameScore = 0;
+    oled.print("Game Start!", "Get Ready...", "");
+    player.playWav(WAV_game_start, WAV_game_start_len);
+    delay(1000);
+    
+    // 随机延迟后亮灯
+    int delayMs = random(1000, 3000);
+    Serial.printf("[GAME] Wait %dms\n", delayMs);
+    oled.print("Wait...", "", "");
+    delay(delayMs);
+    
+    // 亮红灯
+    Serial.println("[GAME] LED ON - GO!");
+    ledRed.on();
+    gameLedOn = true;
+    gameStartTime = millis();
+    currentMode = GAME_PLAY;
+    oled.print("GO! Press BTN3", "", "");
+}
+
+void gameCheck() {
+    if (currentMode != GAME_PLAY) return;
+    
+    if (btn3.pressed() && gameLedOn) {
+        // 计算反应时间
+        unsigned long reaction = millis() - gameStartTime;
+        gameScore++;
+        Serial.printf("[GAME] Correct! Reaction: %lums Score: %d\n", reaction, gameScore);
         
-        if (callTTS()) {
-            playAudio();
-        }
+        ledRed.off();
+        gameLedOn = false;
         
-        if (audioBuffer != NULL) {
-            free(audioBuffer);
-            audioBuffer = NULL;
-        }
+        // 显示分数
+        char buf[32];
+        sprintf(buf, "Score: %d", gameScore);
+        oled.print("Correct!", buf, "");
         
-        Serial.println("=== Done ===");
+        // 播放正确音效
+        player.playWav(WAV_right, WAV_right_len);
+        delay(500);
+        
+        // 下一轮
+        gameStart();
     }
     
-    delay(10);
+    // 超时检测（3秒）
+    if (millis() - gameStartTime > 3000) {
+        Serial.println("[GAME] Timeout - Game Over");
+        ledRed.off();
+        gameLedOn = false;
+        
+        // 游戏结束
+        char buf[32];
+        sprintf(buf, "Final: %d", gameScore);
+        oled.print("Time Up!", buf, "Press BTN3");
+        
+        player.playWav(WAV_game_over, WAV_game_over_len);
+        currentMode = IDLE;
+    }
+}
+
+// ============================================================
+// 第17步：主循环
+// ============================================================
+
+void loop() {
+    // 读取温湿度
+    dht11.read();
+    
+    // 调试：检测按钮状态
+    static int lastBtn2 = HIGH;
+    int btn2State = digitalRead(PIN_BTN2);
+    if (btn2State != lastBtn2) {
+        Serial.printf("[DEBUG] BTN2 changed: %d -> %d\n", lastBtn2, btn2State);
+        lastBtn2 = btn2State;
+    }
+
+    // 按钮1：温湿度播报
+    if (btn1.pressed() && currentMode == IDLE) {
+        Serial.println("[BTN1] Weather mode");
+        currentMode = WEATHER;
+        ledGreen.on();
+        
+        if (dht11.isValid()) {
+            int temp = (int)dht11.getTemperature();
+            int hum = (int)dht11.getHumidity();
+            
+            // OLED显示
+            char buf[32];
+            sprintf(buf, "T:%dC H:%d%%", temp, hum);
+            oled.print("Weather", buf, dht11.isTooHot() ? "HOT!" : "OK");
+            
+            // 播报温度："温度" + 数字
+            player.playWav(WAV_t1, WAV_t1_len);
+            delay(300);
+            playNumber(temp);
+            
+            // 播报湿度："湿度" + 数字
+            delay(300);
+            player.playWav(WAV_h1, WAV_h1_len);
+            delay(300);
+            playNumber(hum);
+            
+            // 过热报警
+            if (dht11.isTooHot()) {
+                delay(300);
+                ledRed.on();
+                player.playWav(WAV_warn_temp, WAV_warn_temp_len);
+                ledRed.off();
+            }
+            
+            // 过湿报警
+            if (dht11.isTooHumid()) {
+                delay(300);
+                ledRed.on();
+                player.playWav(WAV_warn_humi, WAV_warn_humi_len);
+                ledRed.off();
+            }
+        } else {
+            oled.print("DHT11 Error", "Check wiring", "");
+            player.playTone(200, 500);
+        }
+        
+        ledGreen.off();
+        currentMode = IDLE;
+        oled.print("Multi-Device", "Ready!", "Press BTN1-3");
+    }
+
+    // 按钮2：录音/播放
+    if (btn2.pressed() && currentMode == IDLE) {
+        Serial.println("[BTN2] Start recording");
+        recorder.start();
+        currentMode = RECORDING;
+        ledYellow.on();
+        oled.print("Recording...", "Press BTN2", "to stop");
+        player.playWav(WAV_rec_start, WAV_rec_start_len);
+    }
+    
+    if (btn2.pressed() && currentMode == RECORDING) {
+        Serial.println("[BTN2] Stop recording");
+        recorder.stop();
+        currentMode = PLAYING;
+        ledYellow.off();
+        oled.print("Recording", "Stopped");
+        Serial.println("[BTN2] Playing rec_stop");
+        player.playWav(WAV_rec_stop, WAV_rec_stop_len);
+        delay(500);
+        
+        Serial.printf("[BTN2] Recorded %d samples\n", recorder.getLength());
+        oled.print("Playing...", "Wait", "");
+        player.playWav(WAV_play_back, WAV_play_back_len);
+        Serial.println("[BTN2] Playing recording...");
+        recorder.playback(player);
+        Serial.println("[BTN2] Playback done");
+        
+        currentMode = IDLE;
+        oled.print("Multi-Device", "Ready!", "Press BTN1-3");
+    }
+    
+    // 调试：打印按钮状态
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 1000) {
+        lastPrint = millis();
+        Serial.printf("Mode=%d BTN2=%d Recording=%d\n", 
+            currentMode, digitalRead(PIN_BTN2), recorder.isRecording());
+    }
+
+    // 按钮3：游戏
+    if (btn3.pressed() && currentMode == IDLE) {
+        Serial.println("[BTN3] Start game");
+        gameStart();
+    }
+    
+    // 游戏检测
+    gameCheck();
+
+    // 录音采样
+    if (recorder.isRecording()) {
+        int samples = recorder.update();
+        if (samples > 0) {
+            // 更新麦克风音量（实时）
+            updateMicVolume(recorder.getBuffer() + recorder.getBufferSize() - samples, samples);
+        }
+    }
+
+    // 待机呼吸灯
+    if (currentMode == IDLE) {
+        static bool ledState = false;
+        static unsigned long t = 0;
+        if (millis() - t > 500) {
+            t = millis();
+            ledState = !ledState;
+            ledState ? ledGreen.on() : ledGreen.off();
+        }
+        
+        // 显示音量条
+        drawVolumeBars();
+    }
 }
